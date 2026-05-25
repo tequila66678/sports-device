@@ -190,8 +190,10 @@ while alive[0]:
                     process_messages()
                     # Enroll
                     name = str(uid).encode('utf-8')[:32].ljust(32, b'\x00')
-                    data = bytes([0x00]) + name + bytes([0xFD, 15])
-                    send_frame(ser, 0x13, data)
+                    # ENROLL_SINGLE (0x1D): admin, name[32], face_dir, timeout
+                    # face_dir=0x00 = default face, 0xFD = palm (NOT for face)
+                    data = bytes([0x00]) + name + bytes([0x00, 15])
+                    send_frame(ser, 0x1D, data)
                     # Wait for result
                     def is_enroll_reply(c, d):
                         return c == 0x00 and len(d) >= 2 and d[0] in (0x13, 0x1D)
