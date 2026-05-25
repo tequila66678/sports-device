@@ -161,7 +161,7 @@ def submit_scores(token, athletes, student_id_map, test_date):
 
 def load_athletes(filepath="athletes.csv"):
     athletes = {}
-    with open(filepath, encoding="utf-8") as f:
+    with open(filepath, encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             bib = row["bib"].strip()
             athletes[bib] = {
