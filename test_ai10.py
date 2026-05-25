@@ -1,5 +1,7 @@
-"""Quick test: AI-10 serial communication."""
+"""AI-10 test: face recognition + enrollment via serial."""
 import serial
+import sys
+import threading
 import time
 
 PORT = "COM6"
@@ -19,27 +21,42 @@ def send_frame(ser, cmd_id, data=b''):
     checksum = calc_checksum(payload)
     frame = SYNC + payload + bytes([checksum])
     ser.write(frame)
-    print(f"  SEND: {frame.hex()}")
+    return frame
 
 print(f"Opening {PORT}...")
 try:
-    ser = serial.Serial(PORT, BAUD, timeout=0.5)
+    ser = serial.Serial(PORT, BAUD, timeout=0.1)
     print("[OK] Serial opened")
 except Exception as e:
     print(f"[FAIL] {e}")
     input("Press Enter to exit...")
     exit(1)
 
-print("Waiting for AI-10 READY message...")
 buffer = b''
-start = time.time()
-ready = False
+buffer_lock = threading.Lock()
+alive = [True]
 
-while time.time() - start < 5:
-    chunk = ser.read(256)
-    if chunk:
-        buffer += chunk
-        # Search for frames
+def serial_reader():
+    while alive[0]:
+        try:
+            chunk = ser.read(256)
+            if chunk:
+                with buffer_lock:
+                    global buffer
+                    buffer += chunk
+        except:
+            if alive[0]:
+                print("[WARN] Serial read error")
+            break
+
+reader_thread = threading.Thread(target=serial_reader, daemon=True)
+reader_thread.start()
+
+def process_messages():
+    """Parse all complete frames in buffer, return list of parsed messages."""
+    global buffer
+    results = []
+    with buffer_lock:
         while len(buffer) >= 6:
             idx = buffer.find(SYNC)
             if idx < 0:
@@ -57,70 +74,178 @@ while time.time() - start < 5:
             chk = buffer[5 + size]
             actual = calc_checksum(buffer[2:5 + size])
             if chk == actual:
-                if cmd == 0x01 and len(data) >= 1 and data[0] == 0x00:
-                    print("[OK] AI-10 READY!")
-                    ready = True
-                elif cmd == 0x01 and len(data) >= 1 and data[0] == 0x0A:
-                    print(f"  AUTO_VERIFY: {data[1:].hex()}")
-                    if len(data) >= 4 and data[1] == 0x01 and data[2] == 0x00:
-                        user_id = (data[3] << 8) | data[4]
-                        print(f"  >>> RECOGNIZED: user_id={user_id}")
-                elif cmd == 0x01:
-                    print(f"  NOTE: nid={data[0]:02X} data={data[1:].hex()}")
-                elif cmd == 0x00:
-                    print(f"  REPLY: {data.hex()}")
-                else:
-                    print(f"  CMD={cmd:02X}: {data.hex()}")
-            else:
-                pass
+                results.append((cmd, data))
             buffer = buffer[frame_end:]
-    if ready:
-        break
-    time.sleep(0.05)
+    return results
 
-if not ready:
-    print("[WARN] No READY received. Trying RESET command...")
-    send_frame(ser, 0x10)
-    time.sleep(1)
+def wait_for(match_fn, timeout=5.0):
+    """Wait for a message matching match_fn. Returns (cmd, data) or (None, None)."""
+    start = time.time()
+    while time.time() - start < timeout:
+        for cmd, data in process_messages():
+            if cmd == 0x01 and len(data) >= 1 and data[0] == 0x01:
+                continue  # Skip face position spam
+            if match_fn(cmd, data):
+                return (cmd, data)
+            if cmd == 0x01 and len(data) >= 1:
+                nid = data[0]
+                if nid == 0x0A:
+                    if len(data) >= 3 and data[1] == 0x01:
+                        if data[2] == 0x00 and len(data) >= 5:
+                            uid = (data[3] << 8) | data[4]
+                            print(f"  >>> RECOGNIZED: UserID={uid}")
+                        elif data[2] == 0x08:
+                            print(f"  [Unknown face]")
+        time.sleep(0.05)
+    return (None, None)
+
+# Wait for READY
+print("Waiting for AI-10...")
+wait_for(lambda c, d: c == 0x01 and len(d) >= 1 and d[0] == 0x00, 5)
+print("[OK] AI-10 ready")
+
+# Reset
+send_frame(ser, 0x10)
+time.sleep(0.5)
+process_messages()
 
 # Start auto recognition
-print("Starting auto recognition mode...")
-send_frame(ser, 0x12, bytes([0x01, 0xFF]))  # at_verify=1, timeout=infinite
+send_frame(ser, 0x12, bytes([0x01, 0xFF]))
+print("[OK] Auto recognition started")
 
-print("\nListening for face recognition... (look at camera, Ctrl+C to quit)\n")
+print("""
+========================================
+  Commands (type and press Enter):
+    r 101   - Register face for bib 101
+    d 101   - Delete user 101
+    v       - Re-start auto verify
+    q       - Quit
+========================================
+""")
 
 try:
-    while True:
-        chunk = ser.read(256)
-        if chunk:
-            buffer += chunk
-            while len(buffer) >= 6:
-                idx = buffer.find(SYNC)
-                if idx < 0:
-                    buffer = buffer[-4:]
+    import msvcrt
+    has_kb = True
+except ImportError:
+    has_kb = False
+
+cmd_buffer = ""
+last_display = 0
+
+while alive[0]:
+    # Process incoming messages
+    for cmd, data in process_messages():
+        if cmd == 0x01 and len(data) >= 1:
+            nid = data[0]
+            if nid == 0x0A:
+                if len(data) >= 3 and data[1] == 0x01:
+                    if data[2] == 0x00 and len(data) >= 5:
+                        uid = (data[3] << 8) | data[4]
+                        print(f"\n>>> RECOGNIZED: UserID={uid}")
+            elif nid == 0x00:
+                pass  # READY - quiet
+            elif nid != 0x01:
+                print(f"[NOTE] nid={nid:02X} data={data[1:].hex()}")
+        elif cmd == 0x00 and len(data) >= 2:
+            mid = data[0]
+            result = data[1]
+            results = {0:"OK",1:"REJECTED",8:"NOT_FOUND",10:"ALREADY_EXISTS",13:"TIMEOUT"}
+            rname = results.get(result, f"ERR={result}")
+            if mid in (0x13, 0x1D):
+                if result == 0 and len(data) >= 4:
+                    uid = (data[2] << 8) | data[3]
+                    print(f"\n>>> ENROLL OK! UserID={uid}")
+                else:
+                    print(f"\n[ENROLL] {rname}")
+            elif mid == 0x20:
+                print(f"\n[DELETE] {rname}")
+
+    # Keyboard input
+    if has_kb:
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b'\r', b'\n'):
+                parts = cmd_buffer.strip().split()
+                cmd_buffer = ""
+                if not parts:
+                    continue
+                if parts[0] == 'q':
+                    alive[0] = False
                     break
-                buffer = buffer[idx:]
-                if len(buffer) < 6:
-                    break
-                cmd = buffer[2]
-                size = (buffer[3] << 8) | buffer[4]
-                frame_end = 5 + size + 1
-                if len(buffer) < frame_end:
-                    break
-                data = buffer[5:5 + size]
-                chk = buffer[5 + size]
-                actual = calc_checksum(buffer[2:5 + size])
-                if chk == actual:
-                    if cmd == 0x01 and len(data) >= 1 and data[0] == 0x0A:
-                        if len(data) >= 4 and data[1] == 0x01 and data[2] == 0x00:
-                            user_id = (data[3] << 8) | data[4]
-                            print(f"  >>> MATCH: UserID={user_id}")
-                        else:
-                            print(f"  AUTO_VERIFY: {data[1:].hex()}")
-                    elif cmd == 0x01:
-                        print(f"  NOTE: nid={data[0]:02X} data={data[1:].hex()}")
-                buffer = buffer[frame_end:]
-        time.sleep(0.01)
-except KeyboardInterrupt:
-    print("\nDone.")
-    ser.close()
+                elif parts[0] == 'r' and len(parts) >= 2:
+                    try:
+                        uid = int(parts[1])
+                    except:
+                        print("Invalid ID")
+                        continue
+                    print(f"\nRegistering face for ID={uid}...")
+                    print("  Stand in front of camera, look straight ahead")
+                    # Stop auto verify
+                    send_frame(ser, 0x10)
+                    time.sleep(0.3)
+                    process_messages()
+                    # Enroll
+                    name = str(uid).encode('utf-8')[:32].ljust(32, b'\x00')
+                    data = bytes([0x00]) + name + bytes([0xFD, 15])
+                    send_frame(ser, 0x13, data)
+                    # Wait for result
+                    def is_enroll_reply(c, d):
+                        return c == 0x00 and len(d) >= 2 and d[0] in (0x13, 0x1D)
+                    c, d = wait_for(is_enroll_reply, 18)
+                    if c is None:
+                        print("  [TIMEOUT] No response from AI-10")
+                    # Restart auto verify
+                    time.sleep(0.5)
+                    send_frame(ser, 0x12, bytes([0x01, 0xFF]))
+                    print("  Auto recognition restarted")
+                elif parts[0] == 'd' and len(parts) >= 2:
+                    try:
+                        uid = int(parts[1])
+                    except:
+                        print("Invalid ID")
+                        continue
+                    print(f"\nDeleting user ID={uid}...")
+                    send_frame(ser, 0x10)
+                    time.sleep(0.2)
+                    process_messages()
+                    send_frame(ser, 0x20, bytes([(uid >> 8) & 0xFF, uid & 0xFF]))
+                    time.sleep(0.5)
+                    send_frame(ser, 0x12, bytes([0x01, 0xFF]))
+                    print("  Done")
+                elif parts[0] == 'v':
+                    send_frame(ser, 0x10)
+                    time.sleep(0.3)
+                    process_messages()
+                    send_frame(ser, 0x12, bytes([0x01, 0xFF]))
+                    print("  Auto recognition restarted")
+                else:
+                    print(f"  Unknown command: {parts[0]}")
+                print("> ", end='', flush=True)
+            else:
+                try:
+                    cmd_buffer += ch.decode('ascii')
+                    print(ch.decode('ascii'), end='', flush=True)
+                except:
+                    pass
+    else:
+        cmd = input("> ").strip().split()
+        if cmd:
+            if cmd[0] == 'q':
+                alive[0] = False
+                break
+            elif cmd[0] == 'r' and len(cmd) >= 2:
+                uid = int(cmd[1])
+                print(f"Registering face for ID={uid}...")
+                send_frame(ser, 0x10)
+                time.sleep(0.3)
+                process_messages()
+                name = str(uid).encode('utf-8')[:32].ljust(32, b'\x00')
+                send_frame(ser, 0x13, bytes([0x00]) + name + bytes([0xFD, 15]))
+                wait_for(lambda c, d: c == 0x00 and len(d) >= 2 and d[0] in (0x13, 0x1D), 18)
+                send_frame(ser, 0x12, bytes([0x01, 0xFF]))
+
+    time.sleep(0.05)
+
+print("\nDone.")
+alive[0] = False
+ser.close()
