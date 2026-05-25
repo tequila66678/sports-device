@@ -52,8 +52,9 @@ def serial_reader():
 reader_thread = threading.Thread(target=serial_reader, daemon=True)
 reader_thread.start()
 
-def process_messages():
-    """Parse all complete frames in buffer, return list of parsed messages."""
+def process_messages(quiet=True):
+    """Parse all complete frames in buffer, return list of parsed messages.
+    If quiet=True, suppresses face detection spam and prints only important events."""
     global buffer
     results = []
     with buffer_lock:
@@ -74,7 +75,19 @@ def process_messages():
             chk = buffer[5 + size]
             actual = calc_checksum(buffer[2:5 + size])
             if chk == actual:
-                results.append((cmd, data))
+                if not quiet:
+                    results.append((cmd, data))
+                else:
+                    # Only keep important messages (not face position spam)
+                    if cmd == 0x01:
+                        nid = data[0] if len(data) >= 1 else None
+                        if nid == 0x0A:  # Recognition result
+                            results.append((cmd, data))
+                        elif nid == 0x00:  # READY
+                            results.append((cmd, data))
+                        # Skip nid=0x01 (face position) - too much spam
+                    else:
+                        results.append((cmd, data))
             buffer = buffer[frame_end:]
     return results
 
@@ -134,31 +147,22 @@ last_display = 0
 
 while alive[0]:
     # Process incoming messages
-    for cmd, data in process_messages():
-        if cmd == 0x01 and len(data) >= 1:
+    for cmd, data in process_messages(quiet=True):
+        if cmd == 0x01:
             nid = data[0]
-            if nid == 0x0A:
-                if len(data) >= 3 and data[1] == 0x01:
-                    if data[2] == 0x00 and len(data) >= 5:
-                        uid = (data[3] << 8) | data[4]
-                        print(f"\n>>> RECOGNIZED: UserID={uid}")
-            elif nid == 0x00:
-                pass  # READY - quiet
-            elif nid != 0x01:
-                print(f"[NOTE] nid={nid:02X} data={data[1:].hex()}")
+            if nid == 0x0A and len(data) >= 4 and data[1] == 0x01 and data[2] == 0x00:
+                uid = (data[3] << 8) | data[4]
+                print(f">>> RECOGNIZED: UserID={uid}")
         elif cmd == 0x00 and len(data) >= 2:
-            mid = data[0]
-            result = data[1]
-            results = {0:"OK",1:"REJECTED",8:"NOT_FOUND",10:"ALREADY_EXISTS",13:"TIMEOUT"}
-            rname = results.get(result, f"ERR={result}")
+            mid, result = data[0], data[1]
+            rname = {0:"OK",1:"REJECTED",8:"NOT_FOUND",10:"ALREADY_EXISTS",13:"TIMEOUT"}.get(result, f"ERR={result}")
             if mid in (0x13, 0x1D):
                 if result == 0 and len(data) >= 4:
-                    uid = (data[2] << 8) | data[3]
-                    print(f"\n>>> ENROLL OK! UserID={uid}")
+                    print(f">>> ENROLL OK! UserID={(data[2]<<8)|data[3]}")
                 else:
-                    print(f"\n[ENROLL] {rname}")
+                    print(f"[ENROLL] {rname}")
             elif mid == 0x20:
-                print(f"\n[DELETE] {rname}")
+                print(f"[DELETE] {rname}")
 
     # Keyboard input
     if has_kb:
