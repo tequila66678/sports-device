@@ -39,7 +39,7 @@ SERIAL_PORT = "COM3"
 SERIAL_BAUD = 115200
 
 # AI-10 Face Recognition (USB-TTL serial)
-AI10_SERIAL_PORT = "COM4"
+AI10_SERIAL_PORT = "COM6"
 AI10_SERIAL_BAUD = 115200
 FACE_WINDOW_SECONDS = 3.0        # How far back to look for faces before a trigger
 
