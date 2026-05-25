@@ -186,20 +186,37 @@ while alive[0]:
                     print("  Stand in front of camera, look straight ahead")
                     # Stop auto verify
                     send_frame(ser, 0x10)
-                    time.sleep(0.3)
-                    process_messages()
-                    # Enroll
+                    time.sleep(0.5)
+                    # Clear buffer
+                    process_messages(quiet=False)
+                    # Try interactive ENROLL (0x13) - more reliable than ENROLL_SINGLE
                     name = str(uid).encode('utf-8')[:32].ljust(32, b'\x00')
-                    # ENROLL_SINGLE (0x1D): admin, name[32], face_dir, timeout
-                    # face_dir=0x00 = default face, 0xFD = palm (NOT for face)
                     data = bytes([0x00]) + name + bytes([0x00, 15])
-                    send_frame(ser, 0x1D, data)
-                    # Wait for result
-                    def is_enroll_reply(c, d):
-                        return c == 0x00 and len(d) >= 2 and d[0] in (0x13, 0x1D)
-                    c, d = wait_for(is_enroll_reply, 18)
-                    if c is None:
-                        print("  [TIMEOUT] No response from AI-10")
+                    print(f"  Sending ENROLL frame: {len(data)} bytes data")
+                    send_frame(ser, 0x13, data)
+                    # Wait for result with debug
+                    print("  Waiting for reply...")
+                    start = time.time()
+                    enrolled = False
+                    while time.time() - start < 18:
+                        for cmd, d in process_messages(quiet=False):
+                            if cmd == 0x00 and len(d) >= 2:
+                                mid, result = d[0], d[1]
+                                if mid in (0x13, 0x1D) and result == 0:
+                                    uid_out = (d[2] << 8) | d[3] if len(d) >= 4 else '?'
+                                    print(f">>> ENROLL OK! UserID={uid_out}")
+                                    enrolled = True
+                                elif mid in (0x13, 0x1D):
+                                    print(f"  ENROLL result: {result}")
+                            elif cmd == 0x01 and len(d) >= 1:
+                                nid = d[0]
+                                if nid != 0x01:  # Don't spam face position
+                                    print(f"  NOTE: nid={nid:02X} data={d[1:20].hex()}")
+                        if enrolled:
+                            break
+                        time.sleep(0.1)
+                    if not enrolled:
+                        print("  [TIMEOUT] No enrollment result received")
                     # Restart auto verify
                     time.sleep(0.5)
                     send_frame(ser, 0x12, bytes([0x01, 0xFF]))
