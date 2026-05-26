@@ -17,8 +17,9 @@
 
 const int START_SENSOR_PIN   = 2;
 const int FINISH_SENSOR_PIN  = 3;
-const int START_LED_PIN      = 5;   // Green: ON = aligned
-const int FINISH_LED_PIN     = 6;   // Green: ON = aligned
+const int BUTTON_PIN         = 4;   // Manual start button (LOW = pressed)
+const int START_LED_PIN      = 5;   // Green: ON = beam aligned
+const int FINISH_LED_PIN     = 6;   // Green: ON = beam aligned
 const int STATUS_LED_PIN     = 13;  // Red: flash on trigger
 const int BUZZER_PIN         = 9;
 
@@ -27,18 +28,25 @@ const unsigned long BEEP_MS     = 150;
 
 bool start_broken  = false;
 bool finish_broken = false;
+bool button_pressed = false;
 unsigned long last_start  = 0;
 unsigned long last_finish = 0;
+unsigned long last_button = 0;
 
 void setup() {
   Serial.begin(115200);
 
   pinMode(START_SENSOR_PIN, INPUT_PULLUP);
   pinMode(FINISH_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(START_LED_PIN, OUTPUT);
   pinMode(FINISH_LED_PIN, OUTPUT);
   pinMode(STATUS_LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
+
+  // Extra GND pins (unused pins set LOW)
+  pinMode(7, OUTPUT); digitalWrite(7, LOW);
+  pinMode(8, OUTPUT); digitalWrite(8, LOW);
 
   digitalWrite(STATUS_LED_PIN, LOW);
 
@@ -75,11 +83,29 @@ void loop() {
     start_broken = false;
   }
 
+  // --- Manual START button ---
+  int button_state = digitalRead(BUTTON_PIN);
+
+  if (button_state == LOW && !button_pressed) {
+    button_pressed = true;
+    if (now - last_button >= DEBOUNCE_MS) {
+      last_button = now;
+      Serial.println("TRIGGER:START");
+      digitalWrite(STATUS_LED_PIN, HIGH);
+      tone(BUZZER_PIN, 800, BEEP_MS);
+      delay(50);
+      digitalWrite(STATUS_LED_PIN, LOW);
+    }
+  }
+  if (button_state == HIGH && button_pressed) {
+    button_pressed = false;
+  }
+
   // --- FINISH line ---
   int finish_state = digitalRead(FINISH_SENSOR_PIN);
-  digitalWrite(FINISH_LED_PIN, finish_state);  // HIGH = beam intact = LED on
+  digitalWrite(FINISH_LED_PIN, !finish_state);  // LED ON = beam aligned
 
-  if (finish_state == LOW && !finish_broken) {
+  if (finish_state == HIGH && !finish_broken) {
     finish_broken = true;
     if (now - last_finish >= DEBOUNCE_MS) {
       last_finish = now;
@@ -90,7 +116,7 @@ void loop() {
       digitalWrite(STATUS_LED_PIN, LOW);
     }
   }
-  if (finish_state == HIGH && finish_broken) {
+  if (finish_state == LOW && finish_broken) {
     finish_broken = false;
   }
 

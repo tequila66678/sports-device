@@ -35,11 +35,11 @@ ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin123"
 
 # Serial (Arduino - IR sensors)
-SERIAL_PORT = "COM3"
+SERIAL_PORT = "COM6"
 SERIAL_BAUD = 115200
 
 # AI-10 Face Recognition (USB-TTL serial)
-AI10_SERIAL_PORT = "COM6"
+AI10_SERIAL_PORT = "COM4"
 AI10_SERIAL_BAUD = 115200
 FACE_WINDOW_SECONDS = 3.0        # How far back to look for faces before a trigger
 
@@ -95,7 +95,7 @@ def api_call(method, path, token=None, body=None):
     data = json.dumps(body).encode("utf-8") if body else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8") if e.fp else str(e)
@@ -310,78 +310,75 @@ class AI10Serial:
         frame = self.SYNC_WORD + payload + bytes([checksum])
         self.ser.write(frame)
 
-    def start_auto_verify(self, timeout=0xFF):
-        """Put AI-10 into continuous face recognition mode.
-
-        at_verify=1: auto-detect faces and maintain recognition loop.
-        timeout=0xFF: no timeout (run indefinitely).
-        """
-        self.send_frame(self.CMD_VERIFY, bytes([0x01, timeout]))
-
-    def _handle_note(self, data):
-        """Parse a NOTE message from AI-10."""
-        if len(data) < 1:
-            return
-        nid = data[0]
-        payload = data[1:]
-
-        if nid == self.NID_READY:
-            safe_print("  [AI-10] READY")
-        elif nid == self.NID_AUTO_VERIFY and len(payload) >= 2:
-            status = payload[0]
-            result = payload[1]
-            if status == 0x01 and result == self.MR_SUCCESS and len(payload) >= 4:
-                user_id = (payload[2] << 8) | payload[3]
-                if self.face_buffer:
-                    self.face_buffer.add(str(user_id))
+    # Time between single-shot verify attempts
+    VERIFY_INTERVAL = 0.2  # seconds
 
     def _run(self):
-        """Background thread: read serial, parse AI-10 messages, buffer recognized faces."""
+        """Polling loop: send single-shot VERIFY, parse reply, buffer recognized faces."""
         buffer = b''
         while not self._stop.is_set():
-            try:
-                chunk = self.ser.read(256)
+            # Send single-shot verify: at_verify=0, timeout=5s
+            self.send_frame(self.CMD_VERIFY, bytes([0x00, 0x05]))
+            deadline = time.time() + 6.0
+
+            while time.time() < deadline and not self._stop.is_set():
+                try:
+                    chunk = self.ser.read(256)
+                except (OSError, Exception):
+                    if not self._stop.is_set():
+                        self.alive = False
+                        safe_print("[WARN] AI-10 serial disconnected")
+                    break
+
                 if not chunk:
                     continue
-            except (OSError, Exception):
-                if not self._stop.is_set():
-                    self.alive = False
-                    safe_print("[WARN] AI-10 serial disconnected")
-                break
+                buffer += chunk
 
-            buffer += chunk
+                # Search for sync word and parse frames
+                while len(buffer) >= 8:
+                    idx = buffer.find(self.SYNC_WORD)
+                    if idx < 0:
+                        buffer = buffer[-4:]
+                        break
+                    buffer = buffer[idx:]
 
-            # Search for sync word and parse frames
-            while len(buffer) >= 8:
-                idx = buffer.find(self.SYNC_WORD)
-                if idx < 0:
-                    buffer = buffer[-4:]  # Keep tail in case sync is split
-                    break
-                buffer = buffer[idx:]
+                    if len(buffer) < 6:
+                        break
 
-                if len(buffer) < 6:  # Need at least SYNC(2) + CMD(1) + SIZE(2) + CHK(1) = 6
-                    break
+                    cmd = buffer[2]
+                    size = (buffer[3] << 8) | buffer[4]
+                    frame_end = 5 + size + 1
 
-                cmd = buffer[2]
-                size = (buffer[3] << 8) | buffer[4]
-                frame_end = 5 + size + 1  # 5 header bytes + data + checksum
+                    if len(buffer) < frame_end:
+                        break
 
-                if len(buffer) < frame_end:
-                    break  # Incomplete frame, wait for more data
+                    data = buffer[5:5 + size]
+                    expected_chk = buffer[5 + size]
+                    actual_chk = self.calc_checksum(buffer[2:5 + size])
 
-                data = buffer[5:5 + size]
-                expected_chk = buffer[5 + size]
-                actual_chk = self.calc_checksum(buffer[2:5 + size])
+                    if actual_chk == expected_chk:
+                        if cmd == self.MID_NOTE and len(data) >= 1 and data[0] == self.NID_READY:
+                            safe_print("  [AI-10] READY")
+                        elif cmd == self.MID_REPLY and len(data) >= 2:
+                            mid, result = data[0], data[1]
+                            if mid == self.CMD_VERIFY and result == self.MR_SUCCESS and len(data) >= 36:
+                                name_bytes = data[4:36].rstrip(b'\x00')
+                                bib = name_bytes.decode('utf-8', errors='ignore').strip()
+                                if bib and bib in self.athletes:
+                                    if self.face_buffer:
+                                        self.face_buffer.add(bib)
+                                        safe_print(f"  [AI-10] Recognized: bib={bib}")
+                                elif bib:
+                                    safe_print(f"  [AI-10] Unknown bib: '{bib}'")
 
-                if actual_chk == expected_chk:
-                    if cmd == self.MID_NOTE:
-                        self._handle_note(data)
+                    buffer = buffer[frame_end:]
 
-                buffer = buffer[frame_end:]
+            time.sleep(self.VERIFY_INTERVAL)
 
-    def start(self, face_buffer):
+    def start(self, face_buffer, athletes):
         """Open serial port and start background thread."""
         self.face_buffer = face_buffer
+        self.athletes = athletes  # bib -> athlete mapping
         try:
             import serial
         except ImportError:
@@ -393,10 +390,7 @@ class AI10Serial:
             self.alive = True
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
-            # Wait for READY
-            time.sleep(1.5)
-            # Enter auto recognition mode
-            self.start_auto_verify()
+            time.sleep(1.5)  # Wait for READY
             return True
         except Exception as e:
             safe_print(f"[WARN] AI-10 serial {self.port} not available: {e}")
@@ -589,8 +583,14 @@ def main():
     safe_print(f"Loaded {len(athletes)} athletes")
 
     # --- API login ---
-    token = login()
-    student_id_map = resolve_students(token, athletes)
+    token = None
+    student_id_map = {}
+    try:
+        token = login()
+        student_id_map = resolve_students(token, athletes)
+    except Exception as e:
+        safe_print(f"[WARN] API unavailable: {e}")
+        safe_print("[WARN] Running offline — results saved to CSV only")
     safe_print("-" * 50)
 
     # --- Initialize hardware (best-effort) ---
@@ -600,7 +600,7 @@ def main():
 
     face_buffer = FaceBuffer(FACE_WINDOW_SECONDS)
     ai10_serial = AI10Serial(AI10_SERIAL_PORT, AI10_SERIAL_BAUD)
-    ai10_ok = ai10_serial.start(face_buffer)
+    ai10_ok = ai10_serial.start(face_buffer, athletes)
 
     # --- Status ---
     safe_print(f"Arduino (IR):  {'OK' if serial_ok else 'N/A - manual SPACE mode'}")

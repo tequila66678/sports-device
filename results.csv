@@ -1,0 +1,4 @@
+﻿bib,name,student_id,event,time(s),time_ms,status,laps
+001,张三,270119,1000米,2.7,0'03,finished,3
+002,李四,270120,1000米,12.9,0'13,finished,3
+003,王红,270301,800米,23.1,0'23,finished,3
