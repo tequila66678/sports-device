@@ -1,7 +1,7 @@
 """Sniff what PC tool sends for auto-recognition."""
 import serial, time
 
-PORT = "COM4"
+PORT = "COM3"
 BAUD = 115200
 SYNC = bytes([0xEF, 0xAA])
 

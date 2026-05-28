@@ -1,7 +1,7 @@
 """Single-shot face verification - simpler protocol."""
 import serial, time
 
-PORT = "COM4"
+PORT = "COM3"
 BAUD = 115200
 SYNC = bytes([0xEF, 0xAA])
 

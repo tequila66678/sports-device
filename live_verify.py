@@ -1,7 +1,7 @@
 """Live single-shot face recognition - continuous polling."""
 import serial, time, threading
 
-PORT = "COM4"
+PORT = "COM3"
 BAUD = 115200
 SYNC = bytes([0xEF, 0xAA])
 

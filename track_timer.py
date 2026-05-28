@@ -33,15 +33,16 @@ from collections import namedtuple
 API_BASE = "https://sports-dhju.onrender.com"
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin123"
+OFFLINE_MODE = True  # True=跳过网站，只存本地CSV；False=同步到网站
 
 # Serial (Arduino - IR sensors)
 SERIAL_PORT = "COM6"
 SERIAL_BAUD = 115200
 
 # AI-10 Face Recognition (USB-TTL serial)
-AI10_SERIAL_PORT = "COM4"
+AI10_SERIAL_PORT = "COM3"
 AI10_SERIAL_BAUD = 115200
-FACE_WINDOW_SECONDS = 3.0        # How far back to look for faces before a trigger
+FACE_WINDOW_SECONDS = 10.0       # How far back to look for faces before a trigger
 
 # Timing
 TRIGGER_DEBOUNCE_MS = 500         # PC-side minimum interval between finish triggers
@@ -55,10 +56,10 @@ EVENT_MAP = {
 }
 
 PROJECT_RULES = {
-    "1000m": {"start_offset": 200, "lap_distance": 400, "total": 1000},
-    "800m":  {"start_offset": 0,   "lap_distance": 400, "total": 800},
-    "1500m": {"start_offset": 300, "lap_distance": 400, "total": 1500},
-    "400m":  {"start_offset": 0,   "lap_distance": 400, "total": 400},
+    "1000m": {"start_offset": 1000, "lap_distance": 1000, "total": 1000},
+    "800m":  {"start_offset": 800,   "lap_distance": 800, "total": 800},
+    "1500m": {"start_offset": 1500, "lap_distance": 1500, "total": 1500},
+    "400m":  {"start_offset": 400,   "lap_distance": 400, "total": 400},
     "1000米": "1000m",
     "800米":  "800m",
     "1500米": "1500m",
@@ -220,16 +221,20 @@ class FaceBuffer:
             cutoff = timestamp - self.max_age
             self.buffer = [e for e in self.buffer if e.timestamp > cutoff]
 
-    def get_closest(self, reference_time):
+    def get_closest(self, reference_time, consume=True):
         """Return the face event closest to reference_time within the window,
-           or None if no recent faces."""
+           or None if no recent faces. Uses symmetric window (before and after).
+           If consume=True, removes all entries for the matched face_id."""
         with self.lock:
-            cutoff = reference_time - self.max_age
-            recent = [e for e in self.buffer if cutoff <= e.timestamp <= reference_time]
+            recent = [e for e in self.buffer if abs(e.timestamp - reference_time) < self.max_age]
             if not recent:
                 return None
             recent.sort(key=lambda e: abs(e.timestamp - reference_time))
-            return recent[0]
+            match = recent[0]
+            if consume:
+                # Remove all entries for this face_id so next trigger gets a different face
+                self.buffer = [e for e in self.buffer if e.face_id != match.face_id]
+            return match
 
     def get_recent(self, reference_time):
         """Return all face events near reference_time, sorted by proximity."""
@@ -524,7 +529,7 @@ def resolve_bib_from_face(face_buffer, trigger_time, athletes):
 
 
 def process_trigger(event, face_buffer, athletes, start_time):
-    """Handle a trigger: determine bib via AI-10 face buffer or manual entry."""
+    """Handle a trigger: auto-match via AI-10 face buffer or mark as unknown."""
     lap_time = event.timestamp - start_time
 
     if event.source == "start":
@@ -534,30 +539,34 @@ def process_trigger(event, face_buffer, athletes, start_time):
     # FINISH or manual trigger
     safe_print(f"\n[TRIGGER:{event.source.upper()}] {lap_time:.1f}s")
 
-    # --- Try AI-10 face recognition ---
+    # --- Try AI-10 face recognition (immediate, then wait) ---
     bib = None
     method = None
 
     if face_buffer is not None:
+        # Try immediate match first
         bib, method = resolve_bib_from_face(face_buffer, event.timestamp, athletes)
         if bib:
-            safe_print(f"  [AI-10] -> {bib} ({athletes[bib]['name']}) via {method}")
+            safe_print(f"  [AI-10] -> {bib} ({athletes[bib]['name']}) via face")
 
-    # --- Manual fallback ---
-    if bib is None:
-        safe_print("  [AI-10] No recent face detected")
-        while bib is None:
-            raw = input("  Enter bib (or 'skip' to discard): ").strip()
-            if raw.lower() == "skip":
-                safe_print("  Trigger discarded")
-                return
-            if raw in athletes:
-                if athletes[raw]["status"] != "racing":
-                    safe_print(f"  WARN: {athletes[raw]['name']} already finished")
-                    continue
-                bib = raw
+        # If not found, wait for AI-10 to catch up (athlete was just approaching)
+        if bib is None:
+            safe_print("  Waiting for face recognition...", end="", flush=True)
+            for _ in range(50):  # 50 x 0.1s = 5 seconds max wait
+                time.sleep(0.1)
+                safe_print(".", end="", flush=True)
+                bib, method = resolve_bib_from_face(face_buffer, event.timestamp, athletes)
+                if bib:
+                    safe_print(f"\n  [AI-10] -> {bib} ({athletes[bib]['name']}) (delayed match)")
+                    break
             else:
-                safe_print(f"  WARN: bib '{raw}' not found")
+                safe_print("")
+
+    # --- No match: mark as unknown ---
+    if bib is None:
+        safe_print("  [UNKNOWN] No face matched. Trigger saved with no athlete.")
+        safe_print("  Press 'U' after race to review/skip these.")
+        return
 
     # --- Validate ---
     if bib not in athletes:
@@ -585,12 +594,15 @@ def main():
     # --- API login ---
     token = None
     student_id_map = {}
-    try:
-        token = login()
-        student_id_map = resolve_students(token, athletes)
-    except Exception as e:
-        safe_print(f"[WARN] API unavailable: {e}")
-        safe_print("[WARN] Running offline — results saved to CSV only")
+    if OFFLINE_MODE:
+        safe_print("[INFO] OFFLINE MODE — skipping website sync, results saved to CSV only")
+    else:
+        try:
+            token = login()
+            student_id_map = resolve_students(token, athletes)
+        except Exception as e:
+            safe_print(f"[WARN] API unavailable: {e}")
+            safe_print("[WARN] Running offline — results saved to CSV only")
     safe_print("-" * 50)
 
     # --- Initialize hardware (best-effort) ---
@@ -670,11 +682,22 @@ def main():
                         safe_print(f"\n[RACE START] Manual start!")
                         safe_print(f"Base time: {time.strftime('%H:%M:%S')}")
                         safe_print("-" * 50)
+                        safe_print("Race started! Press SPACE or F or ENTER for finish trigger")
                 else:
                     # SPACE = manual finish trigger
                     if now - last_finish_time >= TRIGGER_DEBOUNCE_MS / 1000.0:
                         last_finish_time = now
-                        event_queue.put(TriggerEvent(now, "manual"))
+                        safe_print(f"\n[MANUAL TRIGGER]")
+                        process_trigger(TriggerEvent(now, "manual"), face_buffer, athletes, start_time)
+
+            elif ch in (b'f', b'F', b'\r'):
+                if race_started:
+                    if now - last_finish_time >= TRIGGER_DEBOUNCE_MS / 1000.0:
+                        last_finish_time = now
+                        safe_print(f"\n[MANUAL TRIGGER]")
+                        process_trigger(TriggerEvent(now, "manual"), face_buffer, athletes, start_time)
+                else:
+                    safe_print("Race not started yet. Press SPACE first.")
 
             elif ch in (b'q', b'Q'):
                 break

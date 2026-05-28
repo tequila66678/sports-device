@@ -2,7 +2,7 @@
 import csv, queue, threading, time, sys
 from collections import namedtuple
 
-PORT_AI10 = "COM4"
+PORT_AI10 = "COM3"
 PORT_ARD = "COM6"
 SYNC = bytes([0xEF, 0xAA])
 
